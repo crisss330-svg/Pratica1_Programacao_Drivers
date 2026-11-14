@@ -1,0 +1,444 @@
+"""
+Created on Sat Oct 31 11:22:55 2026
+
+@author: cristiano_oldenburg
+
+Painel Gráfico Executável com Monitoramento em Tempo Real - Modbus TCP (SENAI)
+"""
+
+import socket
+import threading
+import tkinter as tk
+from tkinter import messagebox, scrolledtext, ttk
+from umodbus.client import tcp
+
+# Constantes do dispositivo
+SLAVE_ID = 2
+PORT = 502
+
+# Endereços dos registradores
+REG_MOTOR_ON_OFF = 1100
+REG_MOTOR_DIR = 1101
+REG_MOTOR_STATE = 100
+REG_SPEED_READ = 30400
+REG_CURRENT = 30401
+REG_VOLTAGE = 30402
+REG_TEMP = 30403
+REG_SPEED_WRITE = 41400
+
+
+class PainelInversorApp:
+
+  def __init__(self, root):
+    self.root = root
+    self.root.title("Painel de Controle - Inversor Modbus TCP (Tempo Real)")
+    self.root.geometry("700x820")
+    self.root.minsize(650, 780)
+
+    self.sock = None
+    self.ip_conectado = ""
+    self.monitorando = False
+    self.after_id = None
+
+    self.criar_estilos()
+    self.criar_widgets()
+
+  def criar_estilos(self):
+    self.style = ttk.Style()
+    self.style.theme_use("clam")
+
+  def criar_widgets(self):
+    # --- TÍTULO PRINCIPAL ---
+    lbl_titulo = tk.Label(
+        self.root,
+        text="PAINEL DE CONTROLE E MONITORAMENTO - DRIVES",
+        font=("Arial", 14, "bold"),
+        bg="#1e293b",
+        fg="white",
+        pady=10,
+    )
+    lbl_titulo.pack(fill=tk.X)
+
+    # --- FRAME DE CONEXÃO ---
+    frame_con = ttk.LabelFrame(
+        self.root, text=" Conexão com o Inversor ", padding=10
+    )
+    frame_con.pack(fill=tk.X, padx=15, pady=10)
+
+    ttk.Label(frame_con, text="IP:").grid(row=0, column=0, sticky="w", padx=5)
+    self.entry_ip = ttk.Entry(frame_con, width=16)
+    self.entry_ip.insert(0, "192.168.0.1")
+    self.entry_ip.grid(row=0, column=1, padx=5)
+
+    self.btn_conectar = ttk.Button(
+        frame_con, text="Conectar", command=self.conectar
+    )
+    self.btn_conectar.grid(row=0, column=2, padx=5)
+
+    self.btn_desconectar = ttk.Button(
+        frame_con,
+        text="Desconectar",
+        command=self.desconectar,
+        state="disabled",
+    )
+    self.btn_desconectar.grid(row=0, column=3, padx=5)
+
+    self.lbl_status = ttk.Label(
+        frame_con, text="● Desconectado", foreground="red", font=("Arial", 9, "bold")
+    )
+    self.lbl_status.grid(row=0, column=4, padx=10)
+
+    # --- FRAME DE DASHBOARD AO VIVO (DADOS NA TELA) ---
+    frame_dash = ttk.LabelFrame(
+        self.root, text=" Telemetria em Tempo Real ", padding=10
+    )
+    frame_dash.pack(fill=tk.X, padx=15, pady=5)
+
+    # Criando os cartões visuais para cada variável
+    self.lbl_val_estado = self.criar_card_dash(
+        frame_dash, "ESTADO", "---", 0, 0, "#334155"
+    )
+    self.lbl_val_vel = self.criar_card_dash(
+        frame_dash, "VELOCIDADE", "0 Hz", 0, 1, "#0f766e"
+    )
+    self.lbl_val_curr = self.criar_card_dash(
+        frame_dash, "CORRENTE", "0.0 A", 0, 2, "#1d4ed8"
+    )
+    self.lbl_val_volt = self.criar_card_dash(
+        frame_dash, "TENSÃO", "0 V", 1, 0, "#7c3aed"
+    )
+    self.lbl_val_temp = self.criar_card_dash(
+        frame_dash, "TEMPERATURA", "0 °C", 1, 1, "#b91c1c"
+    )
+
+    # Checkbox / Botão de ligar/desligar monitoramento automático
+    self.chk_monitor_var = tk.BooleanVar(value=True)
+    self.chk_monitor = ttk.Checkbutton(
+        frame_dash,
+        text="Atualização Automática (Ao Vivo)",
+        variable=self.chk_monitor_var,
+    )
+    self.chk_monitor.grid(row=2, column=0, columnspan=3, pady=(10, 0), sticky="w")
+
+    # --- FRAME DE CONTROLES DO MOTOR ---
+    frame_motor = ttk.LabelFrame(
+        self.root, text=" Comandos do Motor ", padding=10
+    )
+    frame_motor.pack(fill=tk.X, padx=15, pady=10)
+
+    self.btn_ligar = ttk.Button(
+        frame_motor,
+        text="🟢 Ligar Motor",
+        command=lambda: self.executar_thread(self.cmd_ligar),
+        state="disabled",
+    )
+    self.btn_ligar.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+
+    self.btn_parar = ttk.Button(
+        frame_motor,
+        text="🔴 Parar Motor",
+        command=lambda: self.executar_thread(self.cmd_parar),
+        state="disabled",
+    )
+    self.btn_parar.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+
+    self.btn_padrao = ttk.Button(
+        frame_motor,
+        text="⚙️ Config. Padrão (30Hz)",
+        command=lambda: self.executar_thread(self.cmd_padrao),
+        state="disabled",
+    )
+    self.btn_padrao.grid(row=0, column=2, padx=5, pady=5, sticky="ew")
+
+    # Velocidade
+    ttk.Label(frame_motor, text="Velocidade (1-60 Hz):").grid(
+        row=1, column=0, sticky="w", padx=5, pady=8
+    )
+    self.entry_vel = ttk.Entry(frame_motor, width=10)
+    self.entry_vel.insert(0, "30")
+    self.entry_vel.grid(row=1, column=1, sticky="w", padx=5, pady=8)
+
+    self.btn_vel = ttk.Button(
+        frame_motor,
+        text="Definir Velocidade",
+        command=lambda: self.executar_thread(self.cmd_velocidade),
+        state="disabled",
+    )
+    self.btn_vel.grid(row=1, column=2, padx=5, pady=8, sticky="ew")
+
+    # Sentido
+    ttk.Label(frame_motor, text="Sentido de Giro:").grid(
+        row=2, column=0, sticky="w", padx=5
+    )
+    self.combo_dir = ttk.Combobox(
+        frame_motor, values=["0 - Horário", "1 - Anti-horário"], state="readonly"
+    )
+    self.combo_dir.current(0)
+    self.combo_dir.grid(row=2, column=1, sticky="w", padx=5)
+
+    self.btn_dir = ttk.Button(
+        frame_motor,
+        text="Mudar Sentido",
+        command=lambda: self.executar_thread(self.cmd_sentido),
+        state="disabled",
+    )
+    self.btn_dir.grid(row=2, column=2, padx=5, sticky="ew")
+
+    frame_motor.columnconfigure(2, weight=1)
+
+    # --- LOG DE RESPOSTAS ---
+    frame_log = ttk.LabelFrame(self.root, text=" Log de Execução ", padding=10)
+    frame_log.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+
+    frame_topo_log = ttk.Frame(frame_log)
+    frame_topo_log.pack(fill=tk.X, pady=(0, 5))
+
+    ttk.Label(frame_topo_log, text="Histórico de Ações:").pack(side=tk.LEFT)
+    self.btn_limpar_log = ttk.Button(
+        frame_topo_log, text="🧹 Limpar Log", command=self.limpar_log
+    )
+    self.btn_limpar_log.pack(side=tk.RIGHT)
+
+    self.txt_log = scrolledtext.ScrolledText(
+        frame_log, wrap=tk.WORD, height=6, font=("Consolas", 9)
+    )
+    self.txt_log.pack(fill=tk.BOTH, expand=True)
+    self.log("Painel iniciado. Conecte-se ao IP do inversor.")
+
+  def criar_card_dash(self, parent, titulo, valor_inicial, linha, coluna, cor):
+    """Cria um card visual estilizado para exibir cada dado de telemetria."""
+    frame = tk.Frame(parent, bg=cor, bd=1, relief="solid", padx=10, pady=8)
+    frame.grid(
+        row=linha, column=coluna, padx=6, pady=6, sticky="nsew", ipadx=10
+    )
+    parent.columnconfigure(coluna, weight=1)
+
+    lbl_t = tk.Label(
+        frame,
+        text=titulo,
+        bg=cor,
+        fg="white",
+        font=("Arial", 8, "bold"),
+    )
+    lbl_t.pack(anchor="w")
+
+    lbl_v = tk.Label(
+        frame,
+        text=valor_inicial,
+        bg=cor,
+        fg="white",
+        font=("Arial", 14, "bold"),
+    )
+    lbl_v.pack(anchor="w", pady=(2, 0))
+    return lbl_v
+
+  def log(self, mensagem):
+    self.txt_log.insert(tk.END, mensagem + "\n")
+    self.txt_log.see(tk.END)
+
+  def limpar_log(self):
+    self.txt_log.delete("1.0", tk.END)
+
+  def conectar(self):
+    ip = self.entry_ip.get().strip()
+    if not ip:
+      messagebox.showerror("Erro", "Digite um endereço IP válido.")
+      return
+
+    try:
+      self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      self.sock.settimeout(2.5)
+      self.sock.connect((ip, PORT))
+      self.ip_conectado = ip
+
+      self.lbl_status.config(text="● Conectado", foreground="green")
+      self.btn_conectar.config(state="disabled")
+      self.btn_desconectar.config(state="normal")
+      self.entry_ip.config(state="disabled")
+
+      for btn in [
+          self.btn_ligar,
+          self.btn_parar,
+          self.btn_padrao,
+          self.btn_vel,
+          self.btn_dir,
+      ]:
+        btn.config(state="normal")
+
+      self.log(f"[Sucesso] Conectado ao inversor no IP {ip}:{PORT}")
+
+      # Iniciar loop de monitoramento automático em tempo real
+      self.monitorando = True
+      self.loop_monitoramento()
+
+    except Exception as e:
+      self.log(f"[Erro de Conexão]: {e}")
+      messagebox.showerror("Erro de Conexão", f"Não foi possível conectar: {e}")
+
+  def desconectar(self):
+    self.monitorando = False
+    if self.after_id:
+      self.root.after_cancel(self.after_id)
+
+    if self.sock:
+      try:
+        self.sock.close()
+      except Exception:
+        pass
+      self.sock = None
+
+    self.lbl_status.config(text="● Desconectado", foreground="red")
+    self.btn_conectar.config(state="normal")
+    self.btn_desconectar.config(state="disabled")
+    self.entry_ip.config(state="normal")
+
+    for btn in [
+        self.btn_ligar,
+        self.btn_parar,
+        self.btn_padrao,
+        self.btn_vel,
+        self.btn_dir,
+    ]:
+      btn.config(state="disabled")
+
+    # Resetar valores do dashboard
+    self.lbl_val_estado.config(text="---")
+    self.lbl_val_vel.config(text="0 Hz")
+    self.lbl_val_curr.config(text="0.0 A")
+    self.lbl_val_volt.config(text="0 V")
+    self.lbl_val_temp.config(text="0 °C")
+
+    self.log(f"[Desconectado] Conexão com o IP {self.ip_conectado} encerrada.")
+    self.ip_conectado = ""
+
+  def loop_monitoramento(self):
+    """Loop contínuo executado em segundo plano para atualizar a tela ao vivo."""
+    if not self.monitorando or not self.sock:
+      return
+
+    def atualizar():
+      try:
+        # Ler Registradores Modbus
+        msg_st = tcp.read_discrete_inputs(
+            slave_id=SLAVE_ID, starting_address=REG_MOTOR_STATE, quantity=1
+        )
+        resp_st = tcp.send_message(msg_st, self.sock)
+        st_txt = (
+            "🟢 Girando"
+            if resp_st and len(resp_st) > 0 and resp_st[0] == 1
+            else "🔴 Parado"
+        )
+
+        msg_sp = tcp.read_input_registers(
+            slave_id=SLAVE_ID, starting_address=REG_SPEED_READ, quantity=1
+        )
+        resp_sp = tcp.send_message(msg_sp, self.sock)
+        vel = f"{resp_sp[0]} Hz" if resp_sp and len(resp_sp) > 0 else "0 Hz"
+
+        msg_tp = tcp.read_input_registers(
+            slave_id=SLAVE_ID, starting_address=REG_TEMP, quantity=1
+        )
+        resp_tp = tcp.send_message(msg_tp, self.sock)
+        temp = f"{resp_tp[0]} °C" if resp_tp and len(resp_tp) > 0 else "0 °C"
+
+        msg_cr = tcp.read_input_registers(
+            slave_id=SLAVE_ID, starting_address=REG_CURRENT, quantity=1
+        )
+        resp_cr = tcp.send_message(msg_cr, self.sock)
+        curr = f"{resp_cr[0]} A" if resp_cr and len(resp_cr) > 0 else "0 A"
+
+        msg_vt = tcp.read_input_registers(
+            slave_id=SLAVE_ID, starting_address=REG_VOLTAGE, quantity=1
+        )
+        resp_vt = tcp.send_message(msg_vt, self.sock)
+        volt = f"{resp_vt[0]} V" if resp_vt and len(resp_vt) > 0 else "0 V"
+
+        # Atualizar os componentes visuais de forma segura na thread principal
+        if self.monitorando:
+          self.root.after(
+              0,
+              lambda: [
+                  self.lbl_val_estado.config(text=st_txt),
+                  self.lbl_val_vel.config(text=vel),
+                  self.lbl_val_temp.config(text=temp),
+                  self.lbl_val_curr.config(text=curr),
+                  self.lbl_val_volt.config(text=volt),
+              ],
+          )
+      except Exception:
+        pass  # Evita travar caso ocorra oscilação momentânea na rede do laboratório
+
+    if self.chk_monitor_var.get():
+      threading.Thread(target=atualizar, daemon=True).start()
+
+    # Reagenda a próxima leitura daqui a 1500ms (1.5 segundos)
+    if self.monitorando:
+      self.after_id = self.root.after(1500, self.loop_monitoramento)
+
+  def executar_thread(self, funcao):
+    threading.Thread(target=funcao, daemon=True).start()
+
+  def enviar(self, message):
+    try:
+      return tcp.send_message(message, self.sock)
+    except Exception as e:
+      self.log(f"[Erro de Comunicação]: {e}")
+      return None
+
+  def cmd_ligar(self):
+    msg = tcp.write_single_coil(
+        slave_id=SLAVE_ID, address=REG_MOTOR_ON_OFF, value=1
+    )
+    self.enviar(msg)
+    self.log("⚡ Comando enviado: Motor LIGADO.")
+
+  def cmd_parar(self):
+    msg = tcp.write_single_coil(
+        slave_id=SLAVE_ID, address=REG_MOTOR_ON_OFF, value=0
+    )
+    self.enviar(msg)
+    self.log("🛑 Comando enviado: Motor PARADO.")
+
+  def cmd_padrao(self):
+    msg_dir = tcp.write_single_coil(
+        slave_id=SLAVE_ID, address=REG_MOTOR_DIR, value=0
+    )
+    self.enviar(msg_dir)
+    msg_speed = tcp.write_single_register(
+        slave_id=SLAVE_ID, address=REG_SPEED_WRITE, value=30
+    )
+    self.enviar(msg_speed)
+    msg_on = tcp.write_single_coil(
+        slave_id=SLAVE_ID, address=REG_MOTOR_ON_OFF, value=1
+    )
+    self.enviar(msg_on)
+    self.log("⚙️ Configuração padrão aplicada: 30Hz, Horário, Ligado.")
+
+  def cmd_velocidade(self):
+    try:
+      vel = int(self.entry_vel.get())
+      if 1 <= vel <= 60:
+        msg = tcp.write_single_register(
+            slave_id=SLAVE_ID, address=REG_SPEED_WRITE, value=vel
+        )
+        self.enviar(msg)
+        self.log(f"🎯 Velocidade ajustada para {vel} Hz.")
+      else:
+        self.log("⚠️ A velocidade deve estar entre 1 e 60 Hz.")
+    except ValueError:
+      self.log("⚠️ Erro: Digite um número inteiro válido.")
+
+  def cmd_sentido(self):
+    val = 0 if "Horário" in self.combo_dir.get() else 1
+    msg = tcp.write_single_coil(
+        slave_id=SLAVE_ID, address=REG_MOTOR_DIR, value=val
+    )
+    self.enviar(msg)
+    sentido_str = "Anti-horário" if val == 1 else "Horário"
+    self.log(f"🔄 Sentido alterado para: {sentido_str}.")
+
+
+if __name__ == "__main__":
+  root = tk.Tk()
+  app = PainelInversorApp(root)
+  root.mainloop()
